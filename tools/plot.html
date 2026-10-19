@@ -1,0 +1,203 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>INA229 capture</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+<style>
+  :root{ --bg:#0f1115; --panel:#171a21; --line:#2a2f3a; --fg:#e6e9ef; --dim:#9aa3b2;
+         --accent:#4fd1c5; }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;-webkit-text-size-adjust:100%}
+  header{padding:10px 12px;border-bottom:1px solid var(--line);background:var(--panel);
+         display:flex;gap:10px;align-items:center}
+  select{flex:1;min-width:0;background:#20242d;color:var(--fg);border:1px solid var(--line);
+    border-radius:6px;padding:8px 10px;font:inherit;min-height:38px}
+  #plot{width:100%;height:68vh;min-height:340px}
+  #note{padding:10px 12px;color:var(--dim);font-size:12px;border-top:1px solid var(--line)}
+  #note b{color:var(--accent)}
+</style>
+</head>
+<body>
+<header><select id="file"></select></header>
+<div id="plot"></div>
+<div id="note">loading…</div>
+
+<script>
+// The page decodes the raw packets itself. The server only lists the files and reads the
+// text lines at the top.
+//
+//   magic A5 5A | seq u16 | count u16 | t_us u32 | q_raw 5B | samples 3B*count | crc16
+//
+// Only packets have timestamps. The ADC runs at a fixed rate, so a packet's samples are
+// spread evenly up to the next packet.
+const HDR = 15, PLOT_MAX = 120000;
+
+// The mean traces, by window length in seconds. Set them to the periods of the device
+// you measure: then each point is the mean current of one period.
+//
+//   8 s    a slow cycle, for a battery estimate
+//   1 s    a 1 s wake-up: the step between two points is what one wake-up cost
+//   100 ms short enough to show bursts and the sleep floor separately
+//
+// A window that does not fit twice into the capture is not drawn.
+const MEAN_WINDOWS = [
+  [0.1, 'mean 100 ms', '#63b3ed', 1.0],
+  [1.0, 'mean 1 s',    '#f6ad55', 1.6],
+  [8.0, 'mean 8 s',    '#b794f4', 2.2],
+];
+
+function fmtA(a){const x=Math.abs(a);
+  if(x>=1e-3)return (a*1e3).toFixed(3)+' mA';
+  if(x>=1e-6)return (a*1e6).toFixed(2)+' µA';
+  return (a*1e9).toFixed(0)+' nA';}
+
+function decode(buf, lsb){
+  const b = new Uint8Array(buf), dv = new DataView(buf);
+  const t = [], i = [], qt = [], q = [];
+  const heads = [];
+  for(let p=0; p+HDR+2<=b.length; ){
+    if(b[p]!==0xA5 || b[p+1]!==0x5A){ p++; continue; }
+    const count = dv.getUint16(p+4, true);
+    const end = p + HDR + 3*count;
+    if(count===0 || count>4096 || end+2 > b.length){ p++; continue; }
+    heads.push([p, dv.getUint32(p+6, true), count, end]);
+    p = end + 2;
+  }
+  for(let k=0;k<heads.length;k++){
+    const [p, t_us, count, end] = heads[k];
+    const nxt = k+1<heads.length ? heads[k+1][1] : t_us + (k? t_us-heads[k-1][1] : count*280);
+    const step = (nxt - t_us) / count;
+    for(let j=0;j<count;j++){
+      const o = p + HDR + 3*j;
+      let v = (b[o]<<16)|(b[o+1]<<8)|b[o+2];   // 24-bit, 20-bit signed data in [23:4]
+      v = (v<<8) >> 12;                        // sign-extend to 20 bits
+      t.push((t_us + j*step)/1e6);
+      i.push(v*lsb);
+    }
+    let qq = 0;
+    for(let n=0;n<5;n++) qq = qq*256 + b[p+10+n];
+    if(qq >= 2**39) qq -= 2**40;
+    qt.push(t_us/1e6); q.push(qq*lsb);
+  }
+  return {t,i,qt,q};
+}
+
+// "every sample": when there are more samples than PLOT_MAX, each group keeps only its
+// lowest and highest sample, at their own times. Nothing is averaged, so no spike is
+// lost. It looks like a band because of the ~20 uA noise per sample (see the README).
+//
+// The mean traces (meanOver) average that noise away: 16 samples leave 4.7 uA, 1000 leave
+// 0.6 uA.
+//
+// Neither trace uses the charge counter: one charge count over a 1 ms bucket is a
+// 312.5 uA step (at 1 ohm, coarse). The totals below the plot use it.
+function envelope(t, i, max){
+  if(t.length <= max) return {t, i};
+  const per = Math.ceil(t.length/max), ot=[], oi=[];
+  for(let k=0;k<t.length;k+=per){
+    let lo=i[k], hi=i[k], lt=t[k], ht=t[k];
+    for(let j=k;j<Math.min(k+per,t.length);j++){
+      if(i[j]<lo){lo=i[j];lt=t[j];} if(i[j]>hi){hi=i[j];ht=t[j];}
+    }
+    if(lt<=ht){ot.push(lt,ht);oi.push(lo,hi);} else {ot.push(ht,lt);oi.push(hi,lo);}
+  }
+  return {t:ot, i:oi};
+}
+
+// Mean over fixed time windows, starting at the first sample. Each point sits at the
+// middle of its window, so it lines up with what it averages.
+function meanOver(t, i, seconds){
+  const ot=[], oi=[];
+  let start=t[0], s=0, n=0;
+  for(let k=0;k<t.length;k++){
+    if(t[k] >= start+seconds){
+      if(n) { ot.push(start+seconds/2); oi.push(s/n); }
+      start += seconds*Math.floor((t[k]-start)/seconds);   // skip any gap in one step
+      s=0; n=0;
+    }
+    s+=i[k]; n++;
+  }
+  if(n){ ot.push(start+seconds/2); oi.push(s/n); }
+  return {t:ot, i:oi};
+}
+
+// Mark labels: each mark gets the next row, and after ROWS rows it starts at the top
+// again. Marks close in time then never overlap, at any zoom.
+const ROWS = 10, LABEL_PX = 10;
+// A label and its line have the same colour.
+const MARK_COLORS = ['#ed64a6','#68d391','#f6ad55','#63b3ed','#f687b3',
+                     '#b794f4','#4fd1c5','#fc8181','#d6bcfa','#9ae6b4'];
+
+function markLabels(marks, heightPx){
+  const step = 1.5*LABEL_PX/Math.max(200, heightPx);      // 1.5 text heights, in paper units
+  return (marks||[]).map((m,k)=>({
+    x:m.t, yref:'paper', y:1 - step*(k%ROWS), text:m.label, showarrow:false,
+    font:{color:MARK_COLORS[k%MARK_COLORS.length], size:LABEL_PX},
+    xanchor:'left', yanchor:'top'}));
+}
+
+async function load(f){
+  const note=document.getElementById('note');
+  note.textContent='loading…';
+  const meta=await (await fetch('/meta'+(f?('?f='+encodeURIComponent(f)):''))).json();
+  if(meta.error){note.textContent=meta.error;return;}
+
+  const sel=document.getElementById('file');
+  sel.innerHTML=meta.files.map(x=>`<option value="${x}"${x===meta.path?' selected':''}>`+
+    `${x.split('/').pop()}</option>`).join('');
+
+  let t,i,qt,q;
+  if(meta.binary){
+    const t0=performance.now();
+    const buf=await (await fetch('/raw?f='+encodeURIComponent(meta.path))).arrayBuffer();
+    ({t,i,qt,q}=decode(buf, meta.lsb));
+    note.textContent=`decoded ${i.length.toLocaleString()} samples in `+
+      `${Math.round(performance.now()-t0)} ms…`;
+  } else {
+    const d=await (await fetch('/data?n=20000&f='+encodeURIComponent(meta.path))).json();
+    t=d.t; i=d.i; qt=d.qt||[]; q=d.q||[]; meta.marks=d.marks;
+  }
+
+  const env=envelope(t,i,PLOT_MAX);
+  const span=t[t.length-1]-t[0];
+  const avgs=MEAN_WINDOWS.filter(w=>span > 2*w[0]).map(([sec,name,color,width])=>{
+    const a=meanOver(t,i,sec);
+    return {x:a.t,y:a.i,type:'scattergl',mode:'lines',name,
+            line:{color,width},hovertemplate:'%{y:.3s}A<extra>'+name+'</extra>'};
+  });
+  Plotly.newPlot('plot',[
+    {x:env.t,y:env.i,type:'scattergl',mode:'lines',name:'every sample',
+     line:{color:'rgba(79,209,197,.28)',width:1},hoverinfo:'skip'},
+    ...avgs,
+  ],{
+    paper_bgcolor:'#0f1115', plot_bgcolor:'#0f1115',
+    font:{color:'#9aa3b2',size:11,family:'ui-monospace,Menlo,monospace'},
+    margin:{l:62,r:12,t:10,b:38},
+    xaxis:{title:{text:'seconds',standoff:6},gridcolor:'#20242d'},
+    yaxis:{title:{text:'current',standoff:6},gridcolor:'#20242d',
+           tickformat:'.2s',ticksuffix:'A'},
+    showlegend:true, legend:{orientation:'h',y:1.12,x:0,font:{size:11}},
+    hovermode:'x unified',
+    shapes:(meta.marks||[]).map((m,k)=>({type:'line',x0:m.t,x1:m.t,yref:'paper',y0:0,y1:1,
+      line:{color:MARK_COLORS[k%MARK_COLORS.length],width:1,dash:'dot'}})),
+    annotations:markLabels(meta.marks, document.getElementById('plot').clientHeight)
+  },{responsive:true,scrollZoom:true,displaylogo:false});
+
+  // Totals come from the charge counter, which is exact.
+  let line=`<b>${i.length.toLocaleString()}</b> samples · <b>${span.toFixed(1)} s</b> · `+
+           `means over ${avgs.map(a=>a.name.replace('mean ','')).join(', ') || '(none fit)'}`;
+  if(q.length>1){
+    const dq=q[q.length-1]-q[0], dt=qt[qt.length-1]-qt[0];
+    line+=` · <b>${(dq*1e3).toFixed(4)} mC</b> = <b>${fmtA(dq/dt)}</b> mean`;
+  }
+  note.innerHTML=line;
+}
+
+document.getElementById('file').onchange=e=>load(e.target.value);
+load();
+</script>
+</body>
+</html>
