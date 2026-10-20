@@ -93,9 +93,21 @@ def _edge_packet(buf, last):
     return found
 
 
+_tail = {"prev": None, "wraps": 0}
+
+
 def report_progress(buf, lsb, elapsed, total_s):
-    """Print one progress line with the mean current so far."""
+    """Print one progress line with the mean current so far.
+
+    The last packet is parsed alone, so its time has no wraps. They are counted here instead:
+    this runs every 30 s, far less than the 71.6 minutes between wraps."""
     first, last = _edge_packet(buf, False), _edge_packet(buf, True)
+    if last:
+        raw = last[1] & 0xFFFFFFFF
+        if _tail["prev"] is not None and raw < _tail["prev"] - (1 << 31):
+            _tail["wraps"] += 1
+        _tail["prev"] = raw
+        last = (last[0], raw + (_tail["wraps"] << 32)) + tuple(last[2:])
     head = f"  {elapsed:5.0f}/{total_s:.0f} s  {len(buf)/1024:7.1f} kB"
     if not first or not last or last[1] == first[1]:
         print(head + "   (no complete packet pair yet)", flush=True)

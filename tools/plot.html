@@ -58,12 +58,18 @@ function decode(buf, lsb){
   const b = new Uint8Array(buf), dv = new DataView(buf);
   const t = [], i = [], qt = [], q = [];
   const heads = [];
+  // t_us is a 32-bit microsecond counter: it wraps after 71.6 minutes. A step back of more
+  // than half the range is a wrap, as in host/stream.py.
+  let prevRaw = null, wraps = 0;
   for(let p=0; p+HDR+2<=b.length; ){
     if(b[p]!==0xA5 || b[p+1]!==0x5A){ p++; continue; }
     const count = dv.getUint16(p+4, true);
     const end = p + HDR + 3*count;
     if(count===0 || count>4096 || end+2 > b.length){ p++; continue; }
-    heads.push([p, dv.getUint32(p+6, true), count, end]);
+    const raw = dv.getUint32(p+6, true);
+    if(prevRaw !== null && raw < prevRaw - 2**31) wraps++;
+    prevRaw = raw;
+    heads.push([p, raw + wraps*2**32, count, end]);
     p = end + 2;
   }
   for(let k=0;k<heads.length;k++){
