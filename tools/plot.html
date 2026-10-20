@@ -54,18 +54,32 @@ function fmtA(a){const x=Math.abs(a);
   if(x>=1e-6)return (a*1e6).toFixed(2)+' µA';
   return (a*1e9).toFixed(0)+' nA';}
 
+// CRC-16/CCITT, as in host/stream.py, with a table for speed.
+const CRC_TABLE = new Uint16Array(256).map((_, n) => {
+  let c = n << 8;
+  for(let k=0;k<8;k++) c = c & 0x8000 ? (c << 1) ^ 0x1021 : c << 1;
+  return c & 0xFFFF;
+});
+function crc16(b, from, to){
+  let c = 0xFFFF;
+  for(let k=from;k<to;k++) c = ((c << 8) ^ CRC_TABLE[(c >> 8) ^ b[k]]) & 0xFFFF;
+  return c;
+}
+
 function decode(buf, lsb){
   const b = new Uint8Array(buf), dv = new DataView(buf);
   const t = [], i = [], qt = [], q = [];
   const heads = [];
   // t_us is a 32-bit microsecond counter: it wraps after 71.6 minutes. A step back of more
-  // than half the range is a wrap, as in host/stream.py.
+  // than half the range is a wrap, as in host/stream.py. Only packets with a good CRC
+  // count, so a damaged timestamp cannot add a false wrap.
   let prevRaw = null, wraps = 0;
   for(let p=0; p+HDR+2<=b.length; ){
     if(b[p]!==0xA5 || b[p+1]!==0x5A){ p++; continue; }
     const count = dv.getUint16(p+4, true);
     const end = p + HDR + 3*count;
     if(count===0 || count>4096 || end+2 > b.length){ p++; continue; }
+    if(dv.getUint16(end, true) !== crc16(b, p, end)){ p++; continue; }
     const raw = dv.getUint32(p+6, true);
     if(prevRaw !== null && raw < prevRaw - 2**31) wraps++;
     prevRaw = raw;
